@@ -1,0 +1,292 @@
+---
+title: "Home Sales Statistics and Regression"
+author: "Mustafa Telab"
+date: "5/16/2021"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '2'
+  pdf_document:
+    toc: yes
+    toc_depth: 2
+---
+
+# Intro
+
+This markdown will utilize a dataset made available by kaggle.com.  The context is a competition to predict the home sale prices of the test set using regression techniques.  We will ultimately be making such submission after we have navigated through the data set, selected our independent variables, and built our model.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r message=FALSE}
+#Import Libraries
+library(tidyverse)
+library(ggcorrplot)
+library(pastecs)
+library(modelr)
+library(MASS, exclude = 'select')
+```
+
+```{r message=FALSE}
+#Import Training Set
+train <- read_csv("house-prices-advanced-regression-techniques/train.csv")
+```
+
+# Explore
+
+Lets begin by retrieving some plots to explore our dependent variable.
+```{r}
+hist(train$SalePrice)
+summary(train$SalePrice)
+```
+## Visualize
+
+We now move onto the possible explanatory variables.  The first selections involve the structure and type of the home.
+```{r}
+train%>%
+ggplot(aes(x = HouseStyle, y = SalePrice)) + geom_boxplot()
+```
+
+Following still with home configuration, we find an interesting reaction with the home level square footage.  These plots with prove important further down for our regression analysis.
+```{r message=FALSE}
+sf_plot = train%>%
+ggplot() + 
+  geom_smooth(aes(x = TotalBsmtSF, y = SalePrice, col = "Basement")) +
+  geom_smooth(aes(x = `1stFlrSF`, y = SalePrice, col = "`1stFloor"))+
+  geom_smooth(aes(x = `2ndFlrSF`, y = SalePrice, col = "`2stFloor"))+
+  labs(title = "Home Levels and Sale Price", x = "Square Feet")
+
+sf_plot
+```
+
+
+```{r}
+vars = c('TotalBsmtSF','1stFlrSF','2ndFlrSF')
+train%>%
+select(vars , SalePrice)%>%
+pairs(c(vars, 'SalePrice'))
+```
+
+## Correlation
+Next we are taking another set of quantitative variables to build a correlation matrix next with the sale price.  The below matrix was landed on after cycling through a series of random samples of pairs. 
+```{r}
+set.seed(997)
+var_pairs = select_if(train,is.numeric)%>%
+  select(SalePrice, sample(1:length(colnames(select_if(train, is.numeric))), 5, replace=F))%>%
+  data.frame()
+var_pairs%>%
+  cor(use = 'na.or.complete') %>%
+  round(2)%>%
+  ggcorrplot( lab = TRUE)
+```
+
+## Correlation Test
+
+Proceeding with a loop through all of the pairs for the above matrix, we collect testing data on the null hypothesis that the correlation is zero.
+```{r}
+rowcounter = 1
+pair_cortest = data.frame(pair = character(),
+                          cor = numeric(),
+                          confidence_80 =numeric(),
+                          p_value =numeric(), 
+                          t_Statistic =numeric(), 
+                          observations=numeric() )
+for (i in seq(1,length(colnames(var_pairs)))) {
+  for (v in seq(1,length(colnames(var_pairs))-i)) {
+    if (i + v <= 6){
+         cort = cor.test(var_pairs[,i],var_pairs[,i+v])
+    pair_cortest[rowcounter,1] = paste0(colnames(var_pairs)[i],"~",colnames(var_pairs)[i+v])
+    pair_cortest[rowcounter,2] = round(cort[["estimate"]][["cor"]],2)
+    pair_cortest[rowcounter,3] = paste0(round(cort[["conf.int"]][1],2)," - ",round(cort[["conf.int"]][2],2))
+    pair_cortest[rowcounter,4] = round(cort[["p.value"]],5)
+    pair_cortest[rowcounter,5] = round(cort[["statistic"]][["t"]],2)
+    pair_cortest[rowcounter,6] = cort[["parameter"]][["df"]]
+    rowcounter = rowcounter +1
+    }
+  }
+}
+```
+
+From the list of correlations below, we can reject the null hypothesis that the correlation between the pairs are zero, for all but the top two pairs in the list.  The top two do not have much of a linear relationship, and the P-value supports this observation.
+```{r}
+pair_cortest[order(-pair_cortest$p_value),]
+```
+
+
+# Matrix Decomposition
+
+```{r}
+cor_matrix = var_pairs%>%
+  cor(use = 'na.or.complete')%>%
+  matrix(nrow = length(colnames(var_pairs)), ncol = length(colnames(var_pairs)))
+```
+
+```{r}
+cor_matrix_P = solve(cor_matrix)
+cor_matrix%*%(cor_matrix_P%*%cor_matrix)
+```
+Matrix LU Decomposition of the correlation matrix
+```{r}
+cor_matrix_L = diag(length(colnames(var_pairs)))
+cor_matrix_U = cor_matrix
+for (j in seq(1,length(colnames(var_pairs)),1)){
+  for (i in seq(1,length(colnames(var_pairs)),1)){
+        if (i > j){
+          term = cor_matrix_U[i,j]/cor_matrix_U[j,j]
+          cor_matrix_U[i,]= cor_matrix_U[i,] - (term* cor_matrix_U[j,])
+          cor_matrix_L[i,j]= term
+    }
+  }
+}
+print(cor_matrix_L)
+print(cor_matrix_U)
+```
+
+We can check that A = LU
+```{r}
+print(cor_matrix)
+print(cor_matrix_L%*%cor_matrix_U)
+```
+
+# Variable Simulation
+
+Looking for a right skewed variable, we stumble upon BsmtUnfSF.  The histogram, along with the difference between the median and mean, make this a good example for this exercise.
+```{r}
+train%>%
+ggplot(aes(x = BsmtUnfSF))+
+  geom_histogram( bins = 60)+
+  geom_density()
+print(summary(train$BsmtUnfSF))
+```
+
+```{r}
+BsmtUnfSFexp = 
+fitdistr(train$BsmtUnfSF+.001, "exponential")
+```
+Our first look at the exponential distribution line on top of the actual histogram.
+```{r}
+basegg = ggplot(train, aes(x = BsmtUnfSF)) + geom_histogram(aes(y=..density..), bins = 30)
+basegg + stat_function(aes(x = train$BsmtUnfSF),fun = dexp, args = list(rate = BsmtUnfSFexp$estimate["rate"]))
+
+```
+
+
+Below we simulate a sample of 1000, plucked from the exponential distribution that we fitted to the data above.
+The plot below features an overlay of two histograms.  The blue represents the data that we pulled from the data set, while the red represents the simulated sample.  The middle 90%(5th and 95th intervals) is marked by vertical lines.  We first notice that the simulation has a wider spread.  Also worth noting that the raw data's 5th percentile is 0, which makes sense considering there are a set of observations at value zero.  However the simulation does not cluster at zero like the empirical data does.
+
+```{r}
+set.seed(92929)
+c_int = t.test(train$BsmtUnfSF)
+expo_sample = rexp(1000, BsmtUnfSFexp$estimate["rate"])
+ggplot()+ 
+  geom_histogram(aes(x = expo_sample, y=..density..*800),  fill = "red", alpha =.8) + 
+  geom_histogram(aes(x = train$BsmtUnfSF, y=..density..*800),  fill = "blue", alpha = .3) +
+  geom_vline(xintercept = quantile(expo_sample,.05), color = "red", show.legend = TRUE)+
+  geom_vline(xintercept = quantile(expo_sample,.95), color = "red", show.legend = TRUE)+
+  geom_vline(xintercept = quantile(train$BsmtUnfSF,.05), color = "blue", show.legend = TRUE)+
+  geom_vline(xintercept = quantile(train$BsmtUnfSF,.95), color = "blue", show.legend = TRUE)+
+  geom_label(aes( x=quantile(expo_sample,.05), y=.50, label=round(quantile(expo_sample,.05),)),color="red",size=7 , angle=45, fontface="bold" )+
+  geom_label(aes( x=quantile(expo_sample,.95), y=.50, label=round(quantile(expo_sample,.95),)),color="red",size=7 , angle=45, fontface="bold" )+
+  geom_label(aes( x=quantile(train$BsmtUnfSF,.05), y=.200, label=round(quantile(train$BsmtUnfSF,.05),)),color="blue",size=7 , angle=45, fontface="bold" )+
+  geom_label(aes( x=quantile(train$BsmtUnfSF,.95), y=.200, label=round(quantile(train$BsmtUnfSF,.95),)),color="blue",size=7 , angle=45, fontface="bold" )+
+  stat_ecdf(aes(x=expo_sample), geom = "step", color = "red")+
+  scale_y_continuous("PDF",sec.axis = sec_axis(~ (. - 0), name = "CDF"))+
+  labs(title = "data sample(BLUE) vs simulation(RED)", subtitle = "5th & 95th percentile marked", x = "value", color = "Legend")+
+  theme(legend.position = "none",panel.grid = element_blank(), axis.text.y = element_blank())
+   
+print(
+  paste0("The 95% confidence interval for the mean of the empirical data is ", round(c_int[["conf.int"]][1])," to ",round(c_int[["conf.int"]][2]))
+)
+``` 
+
+
+# Modeling
+
+
+## Backwards Elimination
+
+To begin our model we first select our variables. These will include the variables we explored earlier and more.  The independent variables chosen here are mostly quantitative, with the exception of 'KitchenQual,' which is included based on the popular adage that "kitchens sell homes."
+
+We will move along using the Backward Elimination method, to trim off what appear to be poor "performing" variables.
+
+```{r}
+mylm = lm(SalePrice ~ GrLivArea + LotArea + YearBuilt + WoodDeckSF + PoolArea + KitchenQual + TotalBsmtSF + BsmtUnfSF + BsmtFinSF2 + MasVnrArea + OverallCond + OverallQual+ GarageArea + EnclosedPorch + LotFrontage + TotRmsAbvGrd  + `1stFlrSF` + `2ndFlrSF`+TotRmsAbvGrd + TotalBsmtSF, data = train)
+summary(mylm)
+```
+
+Some variables under the gun are `1stFlrSF` ,`2ndFlrSF`, and TotalBsmtSF.  These variables refer to the square footage of the different home levels.  GrLivArea, which is a combination of the former two, is also on the chopping block.  From our earlier plots on these variables we know the 1st and 2nd floor footgage follow a similar pattern; so we can move forward with the assumption that the aggregated variable can be used in leu of the separated top floors.  Leaving basement alone for now.
+```{r}
+print(stat.desc(train[c('GrLivArea','1stFlrSF','2ndFlrSF')]))
+```
+```{r}
+mylm = update(mylm, .~. -`2ndFlrSF` -`1stFlrSF`, data = train)
+summary(mylm)
+```
+
+Continue again dropping the values with the highest p-values.(results combined below for readability)
+```{r}
+mylm = update(mylm, .~. -LotFrontage - EnclosedPorch -PoolArea -BsmtFinSF2, data = train)
+summary(mylm)
+```
+
+
+## Residuals
+
+
+Now that we have what appears to be a good collection of predictor variable, we can review the residuals.  We already see from the summary above that the residuals are not centered around zero which is not ideal.  However, we can see that aside from a few outliers.  Thus, the residuals have a fairly normal distribution and can be considered a good sign for our model.
+```{r}
+myres = resid(mylm)
+scplot = plot(myres, type = 'p')
+hplot = hist(myres, breaks = 100)
+qqnorm(myres)
+qqline(myres)
+```
+
+
+
+# Prediction
+
+Now that we are satisfied with the predictive variables and the residuals thus far; we can see how this model reacts to the test data.
+```{r message=FALSE}
+test <- read_csv("house-prices-advanced-regression-techniques/test.csv")
+predictlm = predict(mylm, newdata = test)
+```
+A look at the prediction results.
+```{r}
+hist(predictlm)
+```
+## Missing Values
+
+
+We notice that we have less predictions than observations; which signals that some NAs must have been dropped.  To avoid generating a prediction of NA, we want to first identify the predictive variables that have NA in the test data, and impute over with a reasonable value.
+
+```{r}
+pred_vars = c('Id', colnames(mylm[["model"]])[-1])
+print(summary(select(test,all_of(pred_vars))))
+```
+
+After seeing that the NAs appear for variables that could be considered optional; it is reasonable to set these values to 0.  (Most likely a recording error in the data)
+```{r}
+test = data.frame(test[pred_vars]) %>%
+  replace_na(list(TotalBsmtSF = 0, GarageArea = 0, MasVnrArea = 0,BsmtUnfSF = 0, KitchenQual = 'Gd'))
+
+```
+
+```{r}
+submission = add_predictions(test, mylm, var = 'SalePrice')%>%
+  select('Id', 'SalePrice')%>%
+  data_frame()
+write_csv( submission, "SalePrice_Predictions.csv")
+```
+
+
+
+# Summary and Kaggle Competition Results
+
+lets recap how we landed on our results.  We first explored a few explanatory variables, by following our intuition and testing with plots.  We delved even deeper by putting a correlation matrix together and testing the null hypothesis that the was no correlation.  A portion of the analysis was devoted to a single right skewed variable and attempting to mimic the distribution by sampling from an exponential function.  Then we began our regression with a chunk of  variables until it was trimmed down through backwards elimination.  After reviewing the residuals and cleaning the test data, we finaly earned our score below.
+
+User name: Mustafa Telab
+
+Score: 0.33501
